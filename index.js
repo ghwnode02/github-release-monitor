@@ -2317,6 +2317,8 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         // 测试期间抽屉若被关掉，重新打开设置抽屉，保证用户能看到结果
         const panel = document.getElementById('drawerPanel');
         if (panel && !panel.classList.contains('open')) openDrawer('settings');
+        // 手动测试会在后端写一条站内通知，立即拉取刷新横幅/铃铛/通知列表，不等 60s 轮询
+        loadUpdates();
       }
     }
   </script>
