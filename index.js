@@ -118,6 +118,9 @@ async function initDB(db, retries = 3) {
 
       await db.prepare(`CREATE TABLE IF NOT EXISTS repo_state (repo TEXT PRIMARY KEY, tag TEXT, etag TEXT, errors_json TEXT, updated_at TEXT NOT NULL DEFAULT (datetime('now')))`).run();
 
+      // 站内通知中心：记录每次巡检观测到的版本（UNIQUE(repo, tag) 天然去重）
+      await db.prepare(`CREATE TABLE IF NOT EXISTS release_events (id INTEGER PRIMARY KEY AUTOINCREMENT, repo TEXT NOT NULL, tag TEXT NOT NULL, url TEXT NOT NULL, detected_at TEXT NOT NULL, UNIQUE(repo, tag))`).run();
+
       await db.prepare(`INSERT OR IGNORE INTO check_state (id) VALUES (1)`).run();
 
       // 兼容旧表 version 列
@@ -335,6 +338,60 @@ function sanitizeNotifyChannel(raw) {
     : '{"title":"{title}","content":"{content}"}';
   const enabled = raw.enabled !== false;
   return { type: 'custom_http', enabled, url, method, headers, bodyTemplate };
+}
+
+// ==================== 站内通知中心渠道（release_events + 开关） ====================
+// 语义约定（重要）：
+//   1) release_events 的写入「不受」 system:inapp_channel 开关影响——只要巡检观测到版本就记录，
+//      保证数据完整；用户关掉站内渠道后再打开，仍能看到这段时间累积的更新。
+//   2) 该开关「只」控制前端的铃铛入口 / 未读 badge / 顶部更新横幅是否展示，不参与任何推送链路。
+const RELEASE_EVENTS_KEEP = 200;
+const INAPP_CHANNEL_KEY = 'system:inapp_channel';
+
+function sanitizeInappChannel(raw) {
+  return { enabled: !raw || raw.enabled !== false };
+}
+
+async function getInappChannel(db) {
+  const row = await db.prepare("SELECT value FROM settings WHERE key = ?").bind(INAPP_CHANNEL_KEY).first();
+  if (!row) return { enabled: true };
+  try { return sanitizeInappChannel(JSON.parse(row.value)); }
+  catch { return { enabled: true }; }
+}
+
+async function saveInappChannel(db, val) {
+  const clean = sanitizeInappChannel(val);
+  await db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
+    .bind(INAPP_CHANNEL_KEY, JSON.stringify(clean)).run();
+  return clean;
+}
+
+// 记录一次版本更新事件。整函数 try/catch：失败只打日志，绝不影响巡检主流程。
+// 只认 GitHub Release 详情页（形如 https://github.com/owner/repo/releases/...）
+const RELEASE_URL_RE = /^https:\/\/github\.com\/[^/]+\/[^/]+\/releases\//i;
+function isReleaseUrl(u) { return typeof u === 'string' && RELEASE_URL_RE.test(u); }
+
+async function recordReleaseEvent(db, repo, tag, url) {
+  try {
+    const repoStr = String(repo || '');
+    const tagStr = String(tag || '');
+    const res = await db.prepare("INSERT OR IGNORE INTO release_events (repo, tag, url, detected_at) VALUES (?1, ?2, ?3, ?4)")
+      .bind(repoStr, tagStr, String(url || ''), new Date().toISOString()).run();
+    // 仅在实际插入了新行时才裁剪（取不到 meta.changes 时保守地每次都裁剪）
+    const inserted = !(res && res.meta && typeof res.meta.changes === 'number') || res.meta.changes > 0;
+    if (inserted) {
+      await db.prepare("DELETE FROM release_events WHERE id NOT IN (SELECT id FROM release_events ORDER BY id DESC LIMIT " + RELEASE_EVENTS_KEEP + ")").run();
+    } else if (isReleaseUrl(url)) {
+      // 同一 (repo, tag) 已存在（304 命中缓存时首次落库可能存的是仓库首页）：
+      // 本次拿到了真正的 Release 详情页而库里存的不是，则把链接升级补齐。
+      const row = await db.prepare("SELECT url FROM release_events WHERE repo = ?1 AND tag = ?2").bind(repoStr, tagStr).first();
+      if (row && !isReleaseUrl(row.url)) {
+        await db.prepare("UPDATE release_events SET url = ?1 WHERE repo = ?2 AND tag = ?3").bind(String(url), repoStr, tagStr).run();
+      }
+    }
+  } catch (e) {
+    console.error("记录 release_events 失败（不影响巡检主流程）", e);
+  }
 }
 
 async function getStoredRepos(db) {
@@ -599,6 +656,21 @@ export default {
       return jsonResponse({ success: true, channel: { ...clean, headers: outHeaders } });
     }
 
+    // 站内通知中心开关：只控制前端入口/横幅是否展示，release_events 始终照常记录
+    if (url.pathname === "/api/get-inapp-channel") {
+      const channel = await getInappChannel(db);
+      return jsonResponse({ channel });
+    }
+
+    if (url.pathname === "/api/save-inapp-channel" && request.method === "POST") {
+      if (!body) return jsonResponse({ error: "Missing body" }, 400);
+      if (body.enabled !== undefined && typeof body.enabled !== 'boolean') {
+        return jsonResponse({ success: false, error: "enabled 必须为布尔值" }, 400);
+      }
+      const channel = await saveInappChannel(db, body);
+      return jsonResponse({ success: true, channel });
+    }
+
     // 仓库管理
     if (url.pathname === "/api/get-repos") {
       const repos = await getStoredRepos(db);
@@ -617,6 +689,16 @@ export default {
         return { ...item, health, lastError, reason, judgeReason };
       });
       return jsonResponse(enriched);
+    }
+
+    // 站内通知中心：最近的版本更新事件（只读，按 id 倒序）
+    if (url.pathname === "/api/get-updates") {
+      try {
+        const { results } = await db.prepare("SELECT id, repo, tag, url, detected_at FROM release_events ORDER BY id DESC LIMIT 100").all();
+        return jsonResponse({ updates: (results || []).map(r => ({ id: r.id, repo: r.repo, tag: r.tag, url: r.url, detected_at: r.detected_at })) });
+      } catch (e) {
+        return jsonResponse({ error: "读取更新事件失败: " + e.message }, 500);
+      }
     }
 
     if (url.pathname === "/api/add-repo" && request.method === "POST") {
@@ -943,6 +1025,18 @@ async function checkSingleRepo(env, item, forceTrigger, dndSettings) {
 
     if (!data) throw new Error("无法获取 release 信息");
     const latestTag = data.tag_name;
+
+    // 站内通知中心：把观测到的版本落一条事件（UNIQUE(repo, tag) 去重，重复观测不会叠加）
+    // 注意：这里不看 system:inapp_channel 开关，始终记录，保证数据完整
+    if (latestTag) {
+      // 链接优先取 GitHub 返回体的 html_url（形如 .../releases/tag/v1.2.3）；
+      // 304 命中缓存时 data 只有 { tag_name }，此时 html_url 缺失，回退到 custom_url。
+      // 只接受 https://github.com/ 开头的绝对地址，其余一律回退，防止任意 URL 落库。
+      let eventUrl = targetUrl;
+      const htmlUrl = (data && typeof data.html_url === 'string') ? data.html_url : '';
+      if (/^https:\/\/github\.com\//i.test(htmlUrl)) eventUrl = htmlUrl;
+      await recordReleaseEvent(db, repo, latestTag, eventUrl);
+    }
 
     if (!forceTrigger && !fromCache && res) {
       await setRepoEtag(db, repo, JSON.stringify({ etag: res.headers.get("etag") || "" }));
@@ -1377,14 +1471,118 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
     @media (max-width: 599px) {
       .md-fab { right: var(--space-4); bottom: var(--space-4); }
     }
+    /* ===== AppBar 右侧操作区（铃铛 / 设置） ===== */
+    .header-left { display: flex; align-items: baseline; gap: var(--space-3); min-width: 0; flex-wrap: wrap; }
+    .header-actions { display: flex; align-items: center; gap: var(--space-1); flex: 0 0 auto; }
+    .icon-btn {
+      position: relative; width: 40px; height: 40px; flex: 0 0 auto;
+      display: inline-flex; align-items: center; justify-content: center;
+      border: none; border-radius: 50%; background: transparent; color: var(--md-on-surface);
+      cursor: pointer; transition: background-color var(--dur-fast) var(--ease-standard);
+    }
+    .icon-btn:hover { background: var(--md-surface-2); }
+    .icon-btn:active { background: var(--md-divider); }
+    .icon-btn:focus-visible { outline: 2px solid var(--md-primary); outline-offset: 2px; }
+    .badge-count {
+      position: absolute; top: 3px; right: 3px; min-width: 16px; height: 16px; padding: 0 4px;
+      border-radius: 8px; background: var(--md-error); color: var(--md-on-error);
+      font-size: 10px; font-weight: 500; line-height: 16px; text-align: center; letter-spacing: 0;
+    }
+    .badge-count[hidden] { display: none; }
+    /* ===== 顶部更新横幅（常驻，只有用户点 × 才消失） ===== */
+    #updateBanner { display: flex; flex-direction: column; gap: var(--space-2); margin-bottom: var(--space-6); }
+    #updateBanner:empty { display: none; }
+    .update-banner {
+      display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap;
+      background: var(--md-primary-light); color: var(--md-on-surface);
+      border: 1px solid var(--md-primary-100); border-radius: var(--radius-card);
+      padding: var(--space-3) var(--space-4); box-shadow: var(--elev-1);
+    }
+    .update-banner .ub-text { flex: 1 1 200px; min-width: 0; font-size: 0.875rem; }
+    .update-banner .ub-repo { font-weight: 500; word-break: break-all; }
+    .update-banner .ub-tag { font-family: var(--font-mono); font-size: 0.8125rem; color: var(--md-primary-700); }
+    .update-banner .ub-time { font-size: 0.75rem; color: var(--md-on-surface-medium); margin-top: 2px; }
+    .update-banner a.ub-link { color: var(--md-primary); font-size: 0.8125rem; font-weight: 500; }
+    .update-banner.ub-more .ub-text { color: var(--md-on-surface-medium); }
+    .ub-close {
+      flex: 0 0 auto; width: 32px; height: 32px; border: none; border-radius: 50%;
+      background: transparent; color: var(--md-on-surface-medium); cursor: pointer;
+      display: inline-flex; align-items: center; justify-content: center;
+      transition: background-color var(--dur-fast) var(--ease-standard), color var(--dur-fast) var(--ease-standard);
+    }
+    .ub-close:hover { background: var(--md-primary-100); color: var(--md-on-surface); }
+    .ub-close:focus-visible { outline: 2px solid var(--md-primary); outline-offset: 1px; }
+    .ub-text-btn { width: auto; height: 28px; padding: 0 10px; border-radius: var(--radius-button); font-size: 0.75rem; }
+    /* ===== 右侧抽屉（通知中心 / 设置） ===== */
+    .md-scrim {
+      position: fixed; inset: 0; z-index: 300; background: rgba(0,0,0,0.42);
+      opacity: 0; visibility: hidden;
+      transition: opacity var(--dur-base) var(--ease-standard), visibility var(--dur-base) var(--ease-standard);
+    }
+    .md-scrim.open { opacity: 1; visibility: visible; }
+    .md-drawer {
+      position: fixed; top: 0; right: 0; bottom: 0; z-index: 301;
+      width: min(420px, 100vw); max-width: 100vw;
+      display: flex; flex-direction: column;
+      background: var(--md-surface); color: var(--md-on-surface); box-shadow: var(--elev-16);
+      transform: translateX(100%); visibility: hidden;
+      transition: transform var(--dur-base) var(--ease-standard), visibility var(--dur-base) var(--ease-standard);
+    }
+    .md-drawer.open { transform: translateX(0); visibility: visible; }
+    body.drawer-open { overflow: hidden; }
+    .drawer-header {
+      flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between;
+      height: 56px; padding: 0 var(--space-2) 0 var(--space-4);
+      border-bottom: 1px solid var(--md-divider);
+    }
+    .drawer-header h2 { font-size: 16px; font-weight: 500; line-height: 24px; margin: 0; }
+    .drawer-body { flex: 1 1 auto; overflow-y: auto; padding: var(--space-4); -webkit-overflow-scrolling: touch; }
+    .drawer-pane { display: none; }
+    .drawer-pane.active { display: block; }
+    .drawer-group { margin-bottom: var(--space-6); }
+    .drawer-group:last-child { margin-bottom: 0; }
+    .drawer-group > h3 { font-size: 13px; font-weight: 500; line-height: 20px; margin: 0 0 var(--space-3); color: var(--md-primary); letter-spacing: 0.4px; }
+    .drawer-group .form-group { margin-bottom: var(--space-3); }
+    .drawer-group .form-group label { min-width: 110px; }
+    .drawer-group .input { width: 100%; min-width: 0; }
+    .drawer-group .btn { height: 36px; padding: 0 var(--space-4); font-size: 0.8125rem; }
+    /* ===== 通知中心列表 ===== */
+    .update-item {
+      display: flex; align-items: flex-start; gap: var(--space-2);
+      padding: var(--space-3); margin-bottom: var(--space-2);
+      border: 1px solid var(--md-divider); border-radius: var(--radius-card); background: var(--md-surface);
+      transition: background-color var(--dur-fast) var(--ease-standard);
+    }
+    .update-item:hover { background: var(--md-surface-2); }
+    .update-item .ui-main { flex: 1 1 auto; min-width: 0; cursor: pointer; }
+    .update-item .ui-repo { font-size: 0.875rem; font-weight: 500; word-break: break-all; }
+    .update-item .ui-tag { font-family: var(--font-mono); font-weight: 400; }
+    .update-item .ui-meta { font-size: 0.75rem; color: var(--md-on-surface-medium); margin-top: 2px; }
+    .update-item.ignored { opacity: 0.65; }
+    .update-item.ignored .ui-repo { text-decoration: line-through; }
+    .empty-hint { padding: var(--space-4) 0; text-align: center; font-size: 0.8125rem; color: var(--md-on-surface-medium); }
   </style>
 </head>
 <body>
   <div id="authError" class="auth-error">⛔ 鉴权失败：请提供有效的 API Key</div>
   <header class="app-header">
-    <h1>🔍 GitHub Release 监控</h1>
-    <div class="subtitle" id="clock">北京时间 --:--:--</div>
+    <div class="header-left">
+      <h1>🔍 GitHub Release 监控</h1>
+      <div class="subtitle" id="clock">北京时间 --:--:--</div>
+    </div>
+    <div class="header-actions">
+      <button class="icon-btn" id="bellBtn" type="button" title="通知中心" aria-label="通知中心" onclick="openDrawer('notifications')">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
+        <span class="badge-count" id="updateBadge" hidden>0</span>
+      </button>
+      <button class="icon-btn" id="gearBtn" type="button" title="设置" aria-label="设置" onclick="openDrawer('settings')">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      </button>
+    </div>
   </header>
+
+  <!-- 站内通知中心：更新横幅（常驻显示，只有用户点击关闭才会消失） -->
+  <div id="updateBanner"></div>
 
   <div class="card">
     <h2>⚙️ 检测节奏设置</h2>
@@ -1436,38 +1634,6 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
   </div>
 
   <div class="card">
-    <h2>🔔 通知渠道配置</h2>
-    <p class="help-text">通知发送目的地。留空则回退使用 Cloudflare  secret 的 WEBHOOK_URL / WEBHOOK_AUTH_TOKEN。每个部署读自己的配置，互不干扰。</p>
-    <div class="form-group">
-      <label for="chEnabled">启用自定义通道</label>
-      <input type="checkbox" id="chEnabled" checked>
-    </div>
-    <div class="form-group">
-      <label for="chUrl">请求 URL</label>
-      <input type="text" id="chUrl" class="input" placeholder="https://example.com/webhook" style="flex:1;min-width:240px;">
-    </div>
-    <div class="form-group">
-      <label for="chMethod">请求方法</label>
-      <select id="chMethod" class="input">
-        <option>POST</option><option>GET</option><option>PUT</option><option>PATCH</option>
-      </select>
-    </div>
-    <div class="form-group">
-      <label for="chToken">Authorization 令牌</label>
-      <input type="text" id="chToken" class="input" placeholder="留空则不带 Authorization 头" style="flex:1;min-width:240px;">
-    </div>
-    <div class="form-group">
-      <label for="chBody">请求体模板</label>
-    </div>
-    <textarea id="chBody" spellcheck="false" placeholder='{"title":"{title}","content":"{content}"}' style="width:100%;min-height:90px;font-family:monospace;font-size:0.8rem;"></textarea>
-    <p class="help-text">可用变量：<code>{title}</code> <code>{content}</code> <code>{repo_name}</code> <code>{url}</code> <code>{tag}</code> <code>{message}</code> 等（取自上方通知内容模板的解析结果）。</p>
-    <div class="form-group" style="margin-top:12px;">
-      <button class="btn btn-filled" onclick="saveNotifyChannel()">💾 保存通道</button>
-      <span id="chSaved" style="color:var(--md-sys-color-primary);display:none;">✅ 已保存</span>
-    </div>
-  </div>
-
-  <div class="card">
     <h2>➕ 添加新监控项目</h2>
     <div class="form-group">
       <input type="text" id="repoInput" class="input" placeholder="例如: vuejs/core" onkeydown="if(event.key==='Enter')addRepo()">
@@ -1495,16 +1661,87 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
       </table>
     </div>
   </div>
-
-  <div class="card">
-    <h2>🧪 手动操作</h2>
-    <div style="display:flex;gap:12px;flex-wrap:wrap;">
-      <button class="btn btn-tonal" id="testBtn" onclick="runTest()">🎯 立即测试（随机一个仓库）</button>
-      <button class="btn btn-outlined" onclick="triggerCycle()">🔄 触发新一轮检测</button>
+  <!-- 右侧抽屉：通知中心 / 设置（Esc 或点击遮罩关闭） -->
+  <div id="drawerScrim" class="md-scrim" onclick="closeDrawer()"></div>
+  <aside id="drawerPanel" class="md-drawer" role="dialog" aria-modal="true" aria-labelledby="drawerTitle">
+    <div class="drawer-header">
+      <h2 id="drawerTitle">⚙️ 设置</h2>
+      <button class="icon-btn" type="button" title="关闭" aria-label="关闭" onclick="closeDrawer()"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
     </div>
-    <div id="loadingText" style="display:none;margin-top:12px;color:var(--md-sys-color-on-surface-variant);">⏳ 正在执行，请稍候...</div>
-    <pre id="resultBlock" class="result-block">// 操作结果显示在这里</pre>
-  </div>
+    <div class="drawer-body">
+      <div id="drawerNotifications" class="drawer-pane">
+        <div class="drawer-group">
+          <h3>🔔 更新通知</h3>
+          <div class="form-group" style="justify-content:space-between;gap:8px;">
+            <span class="help-text" id="updateSummary" style="margin:0;">暂无更新</span>
+            <button class="btn btn-outlined" id="clearAllUpdatesBtn" type="button">全部清除</button>
+          </div>
+          <div id="updateList"></div>
+        </div>
+        <div class="drawer-group">
+          <button class="btn btn-tonal" id="toggleIgnoredBtn" type="button" style="width:100%;">查看已忽略 (0)</button>
+          <div id="ignoredList" style="display:none;margin-top:12px;"></div>
+        </div>
+      </div>
+
+      <div id="drawerSettings" class="drawer-pane">
+        <div class="drawer-group">
+          <h3>📢 站内通知中心</h3>
+          <p class="help-text">开启后：检测到版本更新会直接在页面顶部常驻显示（不点关闭就不会消失），右上角铃铛显示未读数量，点条目可跳转到 Release 页面。关闭开关只隐藏入口，后台仍会继续记录更新事件。</p>
+          <div class="form-group">
+            <label for="inappEnabled">启用站内通知</label>
+            <input type="checkbox" id="inappEnabled" checked>
+          </div>
+          <div class="form-group">
+            <button class="btn btn-filled" type="button" onclick="saveInappChannel()">💾 保存</button>
+            <span id="inappSaved" style="font-size:0.8125rem;color:var(--md-sys-color-primary);display:none;">✅ 已保存</span>
+          </div>
+        </div>
+
+        <div class="drawer-group">
+          <h3>🔔 通知渠道配置</h3>
+          <p class="help-text">通知发送目的地。留空则回退使用 Cloudflare  secret 的 WEBHOOK_URL / WEBHOOK_AUTH_TOKEN。每个部署读自己的配置，互不干扰。</p>
+          <div class="form-group">
+            <label for="chEnabled">启用自定义通道</label>
+            <input type="checkbox" id="chEnabled" checked>
+          </div>
+          <div class="form-group">
+            <label for="chUrl">请求 URL</label>
+            <input type="text" id="chUrl" class="input" placeholder="https://example.com/webhook">
+          </div>
+          <div class="form-group">
+            <label for="chMethod">请求方法</label>
+            <select id="chMethod" class="input">
+              <option>POST</option><option>GET</option><option>PUT</option><option>PATCH</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="chToken">Authorization 令牌</label>
+            <input type="text" id="chToken" class="input" placeholder="留空则不带 Authorization 头">
+          </div>
+          <div class="form-group">
+            <label for="chBody">请求体模板</label>
+          </div>
+          <textarea id="chBody" spellcheck="false" placeholder='{"title":"{title}","content":"{content}"}' style="width:100%;min-height:90px;font-family:monospace;font-size:0.8rem;"></textarea>
+          <p class="help-text">可用变量：<code>{title}</code> <code>{content}</code> <code>{repo_name}</code> <code>{url}</code> <code>{tag}</code> <code>{message}</code> 等（取自上方通知内容模板的解析结果）。</p>
+          <div class="form-group" style="margin-top:12px;">
+            <button class="btn btn-filled" type="button" onclick="saveNotifyChannel()">💾 保存通道</button>
+            <span id="chSaved" style="font-size:0.8125rem;color:var(--md-sys-color-primary);display:none;">✅ 已保存</span>
+          </div>
+        </div>
+
+        <div class="drawer-group">
+          <h3>🧪 手动操作</h3>
+          <div style="display:flex;gap:12px;flex-wrap:wrap;">
+            <button class="btn btn-tonal" id="testBtn" type="button" onclick="runTest()">🎯 立即测试（随机一个仓库）</button>
+            <button class="btn btn-outlined" type="button" onclick="triggerCycle()">🔄 触发新一轮检测</button>
+          </div>
+          <div id="loadingText" style="display:none;margin-top:12px;font-size:0.8125rem;color:var(--md-sys-color-on-surface-variant);">⏳ 正在执行，请稍候...</div>
+          <pre id="resultBlock" class="result-block">// 操作结果显示在这里</pre>
+        </div>
+      </div>
+    </div>
+  </aside>
 
   <button class="md-fab" title="添加监控仓库" aria-label="添加监控仓库" onclick="document.getElementById('repoInput').focus()"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></button>
 
@@ -1513,7 +1750,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
     let API_KEY = sessionStorage.getItem('api_key') || '';
     if (params.get('key')) { API_KEY = params.get('key'); sessionStorage.setItem('api_key', API_KEY); window.history.replaceState({}, document.title, window.location.origin + window.location.pathname); }
     function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
-    function escAttr(s) { return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+    function escAttr(s) { return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/'/g,'&#39;'); }
     // 将 UTC ISO 时间字符串格式化为北京时间（UTC+8）显示；withZone=false 时只返回 "YYYY-MM-DD HH:MM:SS"
     function fmtBJ(iso, withZone = true) {
       const d = (typeof iso === 'string') ? new Date(iso) : iso;
@@ -1555,7 +1792,11 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         const input = e.target.closest('.note-input');
         if (input) saveNote(input.dataset.repo, input.value);
       });
+      bindUpdateEvents();
       loadSettings(); loadNotificationConfig(); loadNotifyChannel(); loadRepos();
+      // 站内通知中心：首次加载即拉取，之后每 60 秒轮询一次（横幅常驻，不会自动消失）
+      loadInappChannel(); loadUpdates();
+      setInterval(loadUpdates, 60000);
     });
 
     async function loadSettings() {
@@ -1686,6 +1927,223 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
       } catch (e) { alert('保存失败: ' + e.message); }
     }
 
+    // ==================== 右侧抽屉（通知中心 / 设置） ====================
+    function openDrawer(name) {
+      const isNotif = name === 'notifications';
+      document.getElementById('drawerNotifications').classList.toggle('active', isNotif);
+      document.getElementById('drawerSettings').classList.toggle('active', !isNotif);
+      document.getElementById('drawerTitle').textContent = isNotif ? '🔔 通知中心' : '⚙️ 设置';
+      document.getElementById('drawerScrim').classList.add('open');
+      document.getElementById('drawerPanel').classList.add('open');
+      document.body.classList.add('drawer-open');
+      if (isNotif) renderUpdates();
+    }
+    function closeDrawer() {
+      document.getElementById('drawerScrim').classList.remove('open');
+      document.getElementById('drawerPanel').classList.remove('open');
+      document.body.classList.remove('drawer-open');
+    }
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeDrawer(); });
+
+    // ==================== 站内通知中心 ====================
+    const DISMISS_KEY = 'grm_dismissed_updates';
+    const DISMISS_MAX = 2000;
+    let inappEnabled = true;      // 站内渠道开关（只影响前端展示，后端始终记录）
+    let updatesCache = [];        // /api/get-updates 的原始列表
+    let showIgnored = false;      // 是否展开「已忽略」
+
+    // 只接受 http(s) 绝对地址，其余一律不渲染成链接
+    function safeUrl(u) {
+      if (typeof u !== 'string') return '';
+      return (u.indexOf('http://') === 0 || u.indexOf('https://') === 0) ? u : '';
+    }
+    function openRelease(url) {
+      const w = window.open(url, '_blank');
+      if (w) w.opener = null;
+    }
+    function readDismissed() {
+      try {
+        const arr = JSON.parse(localStorage.getItem(DISMISS_KEY) || '[]');
+        return Array.isArray(arr) ? arr.map(Number).filter(n => !isNaN(n)) : [];
+      } catch (e) { return []; }
+    }
+    function writeDismissed(arr) {
+      try {
+        let kept = arr;
+        // 裁剪时只保留仍在 updatesCache 中出现的 id，避免丢弃最早的已关闭记录导致它们「复活」；
+        // updatesCache 为空（尚未拉取完成）时保持原样，避免误删。
+        if (updatesCache.length) {
+          const live = updatesCache.map(u => Number(u.id));
+          kept = kept.filter(id => live.indexOf(Number(id)) !== -1);
+        }
+        localStorage.setItem(DISMISS_KEY, JSON.stringify(kept.slice(-DISMISS_MAX)));
+      } catch (e) { /* 忽略 */ }
+    }
+    function dismissUpdate(id) {
+      const arr = readDismissed();
+      if (arr.indexOf(Number(id)) === -1) arr.push(Number(id));
+      writeDismissed(arr);
+      renderUpdates();
+    }
+    function restoreUpdate(id) {
+      writeDismissed(readDismissed().filter(n => n !== Number(id)));
+      renderUpdates();
+    }
+    function clearAllUpdates() {
+      const merged = readDismissed().concat(updatesCache.map(u => Number(u.id)));
+      writeDismissed(merged.filter((v, i, a) => a.indexOf(v) === i));
+      renderUpdates();
+    }
+    function splitUpdates() {
+      const dismissed = readDismissed();
+      const active = [], ignored = [];
+      for (const u of updatesCache) {
+        (dismissed.indexOf(Number(u.id)) === -1 ? active : ignored).push(u);
+      }
+      return { active, ignored };
+    }
+
+    let updatesInFlight = false;  // 轮询防重入：上一次 /api/get-updates 未结束时直接跳过
+    async function loadUpdates() {
+      if (updatesInFlight) return;
+      updatesInFlight = true;
+      try {
+        const res = await apiFetch('/api/get-updates');
+        const data = await res.json();
+        updatesCache = Array.isArray(data.updates) ? data.updates : [];
+      } catch (e) { updatesCache = []; }
+      finally { updatesInFlight = false; }
+      renderUpdates();
+    }
+
+    async function loadInappChannel() {
+      try {
+        const res = await apiFetch('/api/get-inapp-channel');
+        const data = await res.json();
+        inappEnabled = !data.channel || data.channel.enabled !== false;
+      } catch (e) { inappEnabled = true; }
+      const cb = document.getElementById('inappEnabled');
+      if (cb) cb.checked = inappEnabled;
+      renderUpdates();
+    }
+
+    async function saveInappChannel() {
+      const cb = document.getElementById('inappEnabled');
+      const enabled = cb ? cb.checked : true;
+      try {
+        const res = await apiFetch('/api/save-inapp-channel', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled }) });
+        const data = await res.json();
+        if (data.success) {
+          inappEnabled = enabled;
+          const s = document.getElementById('inappSaved');
+          if (s) { s.style.display = 'inline'; setTimeout(() => { s.style.display = 'none'; }, 2000); }
+          renderUpdates();
+        } else if (data.error) alert(data.error);
+      } catch (e) { alert('保存失败: ' + e.message); }
+    }
+
+    // 统一渲染：顶部横幅 + 通知列表 + 铃铛未读数
+    function renderUpdates() {
+      const parts = splitUpdates();
+      renderBanners(inappEnabled ? parts.active : []);
+      renderUpdateList(inappEnabled ? parts.active : [], inappEnabled ? parts.ignored : []);
+      const badge = document.getElementById('updateBadge');
+      if (badge) {
+        if (inappEnabled && parts.active.length) {
+          badge.textContent = parts.active.length > 99 ? '99+' : String(parts.active.length);
+          badge.hidden = false;
+        } else {
+          badge.hidden = true;
+        }
+      }
+      const bell = document.getElementById('bellBtn');
+      if (bell) bell.style.display = inappEnabled ? '' : 'none';
+    }
+
+    const CLOSE_SVG = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+
+    // 顶部横幅：常驻显示，不设任何自动隐藏定时器；最多只展示最新 BANNER_MAX 条，
+    // 避免极端情况下堆叠上百条把主页内容挤走，多余的折叠成一条「查看全部」入口。
+    const BANNER_MAX = 5;
+    function renderBanners(list) {
+      const box = document.getElementById('updateBanner');
+      if (!box) return;
+      if (!list.length) { box.innerHTML = ''; return; }
+      const shown = list.slice(0, BANNER_MAX);
+      let html = shown.map(u => {
+        const url = safeUrl(u.url);
+        const link = url
+          ? '<a class="ub-link" href="' + escAttr(url) + '" target="_blank" rel="noopener noreferrer">查看 Release ↗</a>'
+          : '<span class="ub-link" style="color:var(--md-sys-color-on-surface-variant);">无可用链接</span>';
+        return '<div class="update-banner" data-id="' + escAttr(u.id) + '">' +
+            '<div class="ub-text">' +
+              '<div><span class="ub-repo">🚀 ' + esc(u.repo) + '</span> <span class="ub-tag">' + esc(u.tag) + '</span></div>' +
+              '<div class="ub-time">检测于 ' + esc(fmtBJ(u.detected_at)) + '</div>' +
+            '</div>' + link +
+            '<button class="ub-close" type="button" data-action="dismiss" data-id="' + escAttr(u.id) + '" title="关闭这条通知" aria-label="关闭这条通知">' + CLOSE_SVG + '</button>' +
+          '</div>';
+      }).join('');
+      const rest = list.length - shown.length;
+      if (rest > 0) {
+        html += '<div class="update-banner ub-more">' +
+            '<div class="ub-text">还有 ' + rest + ' 条更新</div>' +
+            '<button class="ub-close ub-text-btn" type="button" onclick="openDrawer(\'notifications\')">查看全部</button>' +
+          '</div>';
+      }
+      box.innerHTML = html;
+    }
+
+    function updateItemHtml(u, isIgnored) {
+      const url = safeUrl(u.url);
+      const urlAttr = url ? ' data-url="' + escAttr(url) + '"' : '';
+      const actionBtn = isIgnored
+        ? '<button class="ub-close ub-text-btn" type="button" data-action="restore" data-id="' + escAttr(u.id) + '">恢复</button>'
+        : '<button class="ub-close" type="button" data-action="dismiss" data-id="' + escAttr(u.id) + '" title="关闭这条通知" aria-label="关闭这条通知">' + CLOSE_SVG + '</button>';
+      const tips = (isIgnored ? ' · 已忽略' : '') + (url ? ' · 点击打开 Release' : '');
+      return '<div class="update-item' + (isIgnored ? ' ignored' : '') + '" data-id="' + escAttr(u.id) + '">' +
+          '<div class="ui-main" data-action="open"' + urlAttr + '>' +
+            '<div class="ui-repo">' + esc(u.repo) + ' <span class="ui-tag">' + esc(u.tag) + '</span></div>' +
+            '<div class="ui-meta">' + esc(fmtBJ(u.detected_at)) + tips + '</div>' +
+          '</div>' + actionBtn +
+        '</div>';
+    }
+
+    function renderUpdateList(active, ignored) {
+      const box = document.getElementById('updateList');
+      const igBox = document.getElementById('ignoredList');
+      const toggleBtn = document.getElementById('toggleIgnoredBtn');
+      const summary = document.getElementById('updateSummary');
+      if (summary) summary.textContent = active.length ? ('共 ' + active.length + ' 条未关闭的更新') : '暂无未关闭的更新';
+      if (toggleBtn) toggleBtn.textContent = '查看已忽略 (' + ignored.length + ')';
+      if (box) box.innerHTML = active.length ? active.map(u => updateItemHtml(u, false)).join('') : '<div class="empty-hint">暂无更新通知</div>';
+      if (igBox) {
+        igBox.style.display = showIgnored ? 'block' : 'none';
+        igBox.innerHTML = showIgnored
+          ? (ignored.length ? ignored.map(u => updateItemHtml(u, true)).join('') : '<div class="empty-hint">没有已忽略的更新</div>')
+          : '';
+      }
+    }
+
+    // 事件委托：不使用 onclick 内联插值，全部走 data-action / data-id
+    function bindUpdateEvents() {
+      const handler = (e) => {
+        const el = e.target.closest('[data-action]');
+        if (!el) return;
+        const id = el.getAttribute('data-id');
+        const action = el.getAttribute('data-action');
+        if (action === 'dismiss' && id) dismissUpdate(id);
+        else if (action === 'restore' && id) restoreUpdate(id);
+        else if (action === 'open') {
+          const url = safeUrl(el.getAttribute('data-url'));
+          if (url) openRelease(url);
+        }
+      };
+      document.getElementById('updateBanner').addEventListener('click', handler);
+      document.getElementById('drawerNotifications').addEventListener('click', handler);
+      document.getElementById('clearAllUpdatesBtn').addEventListener('click', clearAllUpdates);
+      document.getElementById('toggleIgnoredBtn').addEventListener('click', () => { showIgnored = !showIgnored; renderUpdates(); });
+    }
+
     async function triggerCycle() {
       try {
         const res = await apiFetch('/api/trigger-cycle', { method:'POST' });
@@ -1797,7 +2255,12 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         }
       }
       catch (e) { resultBlock.textContent = '请求失败: ' + e.message; }
-      finally { btn.disabled = false; loading.style.display = 'none'; }
+      finally {
+        btn.disabled = false; loading.style.display = 'none';
+        // 测试期间抽屉若被关掉，重新打开设置抽屉，保证用户能看到结果
+        const panel = document.getElementById('drawerPanel');
+        if (panel && !panel.classList.contains('open')) openDrawer('settings');
+      }
     }
   </script>
 </body>
