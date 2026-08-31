@@ -2095,7 +2095,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
       if (rest > 0) {
         html += '<div class="update-banner ub-more">' +
             '<div class="ub-text">还有 ' + rest + ' 条更新</div>' +
-            '<button class="ub-close ub-text-btn" type="button" onclick="openDrawer(\'notifications\')">查看全部</button>' +
+            '<button class="ub-close ub-text-btn" type="button" data-action="drawer" data-drawer="notifications">查看全部</button>' +
           '</div>';
       }
       box.innerHTML = html;
@@ -2141,6 +2141,10 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         const action = el.getAttribute('data-action');
         if (action === 'dismiss' && id) dismissUpdate(id);
         else if (action === 'restore' && id) restoreUpdate(id);
+        else if (action === 'drawer') {
+          const d = el.getAttribute('data-drawer');
+          if (d) openDrawer(d);
+        }
         else if (action === 'open') {
           const url = safeUrl(el.getAttribute('data-url'));
           if (url) openRelease(url);
