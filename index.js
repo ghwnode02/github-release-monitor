@@ -366,7 +366,9 @@ async function saveInappChannel(db, val) {
   return clean;
 }
 
-// 记录一次版本更新事件。整函数 try/catch：失败只打日志，绝不影响巡检主流程。
+// 记录一次版本更新事件。只由 checkSingleRepo 在「真的检测到新版本」时调用；
+// 同一 (repo, tag) 靠 release_events 的 UNIQUE 约束天然去重，重复调用不会叠加。
+// 整函数 try/catch：失败只打日志，绝不影响巡检主流程。
 // 只认 GitHub Release 详情页（形如 https://github.com/owner/repo/releases/...）
 const RELEASE_URL_RE = /^https:\/\/github\.com\/[^/]+\/[^/]+\/releases\//i;
 function isReleaseUrl(u) { return typeof u === 'string' && RELEASE_URL_RE.test(u); }
@@ -1026,18 +1028,6 @@ async function checkSingleRepo(env, item, forceTrigger, dndSettings) {
     if (!data) throw new Error("无法获取 release 信息");
     const latestTag = data.tag_name;
 
-    // 站内通知中心：把观测到的版本落一条事件（UNIQUE(repo, tag) 去重，重复观测不会叠加）
-    // 注意：这里不看 system:inapp_channel 开关，始终记录，保证数据完整
-    if (latestTag) {
-      // 链接优先取 GitHub 返回体的 html_url（形如 .../releases/tag/v1.2.3）；
-      // 304 命中缓存时 data 只有 { tag_name }，此时 html_url 缺失，回退到 custom_url。
-      // 只接受 https://github.com/ 开头的绝对地址，其余一律回退，防止任意 URL 落库。
-      let eventUrl = targetUrl;
-      const htmlUrl = (data && typeof data.html_url === 'string') ? data.html_url : '';
-      if (/^https:\/\/github\.com\//i.test(htmlUrl)) eventUrl = htmlUrl;
-      await recordReleaseEvent(db, repo, latestTag, eventUrl);
-    }
-
     if (!forceTrigger && !fromCache && res) {
       await setRepoEtag(db, repo, JSON.stringify({ etag: res.headers.get("etag") || "" }));
     }
@@ -1048,6 +1038,24 @@ async function checkSingleRepo(env, item, forceTrigger, dndSettings) {
     }
 
     const isNew = latestTag && latestTag !== oldTag;
+    // 站内通知中心：只在「真的检测到新版本」时记录一条事件（UNIQUE(repo, tag) 去重）。
+    // 刻意不记录以下几种情况，避免通知中心被噪音淹没：
+    //   ① 每轮巡检观测到的「当前版本」——否则 32 个仓库跑完一个周期会全部变成「更新」；
+    //   ② 手动测试（forceTrigger）——测试不是真实更新；
+    //   ③ 首次接入的仓库（oldTag 为空）——那属于基线，不是更新。
+    if (!forceTrigger && isNew && oldTag) {
+      let eventUrl;
+      const htmlUrl = (data && typeof data.html_url === 'string') ? data.html_url : '';
+      if (/^https:\/\/github\.com\//i.test(htmlUrl)) {
+        eventUrl = htmlUrl;
+      } else if (/^[^/\s]+\/[^/\s]+$/.test(repo)) {
+        // 兜底：按 GitHub 固定格式拼 Release 详情页，避免落库成仓库首页导致「查看 Release」跳错
+        eventUrl = 'https://github.com/' + repo + '/releases/tag/' + encodeURIComponent(latestTag);
+      } else {
+        eventUrl = targetUrl;
+      }
+      await recordReleaseEvent(db, repo, latestTag, eventUrl);
+    }
     // 已成功通知的版本（去重依据）；forceTrigger 时不读取，始终强制推送
     const lastNotified = forceTrigger ? null : await getRepoNotifiedTag(db, repo);
     const alreadyNotified = !!latestTag && latestTag === lastNotified;
