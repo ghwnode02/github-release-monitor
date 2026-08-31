@@ -275,16 +275,35 @@ async function tryAdvanceAndGetRepo(db) {
 }
 
 // ==================== 数据访问层 ====================
+// getSettings 短 TTL 缓存：同 isolate 内跨请求共享，15 秒内不再查 D1。
+// saveSettings 会清缓存，因此本 isolate 内的设置变更能即时被感知；
+// getSettings 返回浅拷贝，防止调用方（如 /api/save-settings 内联改字段）改坏缓存本体。
+let _settingsCache = null;
+let _settingsCacheAt = 0;
+const SETTINGS_CACHE_TTL_MS = 15000;
 async function getSettings(db) {
+  const now = Date.now();
+  if (_settingsCache && now - _settingsCacheAt < SETTINGS_CACHE_TTL_MS) {
+    return { ..._settingsCache, dnd: { ...(_settingsCache.dnd || {}) } };
+  }
   const row = await db.prepare("SELECT value FROM settings WHERE key = 'system:settings'").first();
-  if (!row) return { ...DEFAULT_SETTINGS };
-  try { return { ...DEFAULT_SETTINGS, ...JSON.parse(row.value) }; }
-  catch { return { ...DEFAULT_SETTINGS }; }
+  let s;
+  if (!row) s = { ...DEFAULT_SETTINGS };
+  else {
+    try { s = { ...DEFAULT_SETTINGS, ...JSON.parse(row.value) }; }
+    catch { s = { ...DEFAULT_SETTINGS }; }
+  }
+  s.dnd = { ...(DEFAULT_SETTINGS.dnd || {}), ...(s.dnd || {}) };
+  _settingsCache = s;
+  _settingsCacheAt = now;
+  return { ...s, dnd: { ...s.dnd } };
 }
 
 async function saveSettings(db, settings) {
   await db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('system:settings', ?)")
     .bind(JSON.stringify(settings)).run();
+  _settingsCache = null;
+  _settingsCacheAt = 0;
 }
 
 async function getNotificationTemplate(db) {
@@ -1038,12 +1057,13 @@ async function checkSingleRepo(env, item, forceTrigger, dndSettings) {
     }
 
     const isNew = latestTag && latestTag !== oldTag;
-    // 站内通知中心：只在「真的检测到新版本」时记录一条事件（UNIQUE(repo, tag) 去重）。
-    // 刻意不记录以下几种情况，避免通知中心被噪音淹没：
-    //   ① 每轮巡检观测到的「当前版本」——否则 32 个仓库跑完一个周期会全部变成「更新」；
-    //   ② 手动测试（forceTrigger）——测试不是真实更新；
-    //   ③ 首次接入的仓库（oldTag 为空）——那属于基线，不是更新。
-    if (!forceTrigger && isNew && oldTag) {
+    // 站内通知中心：记录「新版本」事件（release_events 靠 UNIQUE(repo, tag) 去重，重复不会叠加）。
+    // 记与不记的语义：
+    //   ① 每轮巡检只记「真的新版本」（isNew && oldTag 有值）——否则 32 个仓库跑完一个周期会全部变成「更新」噪音；
+    //   ② 手动测试（forceTrigger 时 oldTag 为 null，isNew 即「成功拿到 tag」）也会记录一条事件，
+    //      供用户在通知中心查看测试结果；同一仓库同一 tag 反复测试仍被 UNIQUE 去重；
+    //   ③ 首次接入的仓库（oldTag 为空且非手动测试）——那属于基线，不是更新，不记录。
+    if (isNew && (forceTrigger || oldTag)) {
       let eventUrl;
       const htmlUrl = (data && typeof data.html_url === 'string') ? data.html_url : '';
       if (/^https:\/\/github\.com\//i.test(htmlUrl)) {
@@ -1593,55 +1613,6 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
   <div id="updateBanner"></div>
 
   <div class="card">
-    <h2>⚙️ 检测节奏设置</h2>
-    <div class="form-group">
-      <label for="repoInterval">仓库检查间隔（分钟）</label>
-      <input type="number" id="repoInterval" class="input" min="5" max="60" value="5">
-      <span style="font-size:0.75rem;color:var(--md-sys-color-on-surface-variant);">每仓库等待时间</span>
-    </div>
-    <div class="form-group">
-      <label for="cycleInterval">检测周期间隔（小时）</label>
-      <input type="number" id="cycleInterval" class="input" min="1" max="48" value="8">
-      <span style="font-size:0.75rem;color:var(--md-sys-color-on-surface-variant);">两轮检测之间等待</span>
-    </div>
-    <hr style="border:none;border-top:1px solid var(--md-sys-color-outline-variant);margin:8px 0 16px;">
-    <h3 style="font-size:1rem;font-weight:500;margin-bottom:8px;">🔕 免打扰模式</h3>
-    <p class="help-text">在指定时段（北京时间 UTC+8）内不发送任何通知；若此间有版本更新，将保留并在免打扰结束后自动补发。</p>
-    <div class="form-group">
-      <label for="dndEnabled">启用免打扰</label>
-      <input type="checkbox" id="dndEnabled">
-      <span id="dndStatus" style="font-size:0.8rem;color:var(--md-sys-color-on-surface-variant);"></span>
-    </div>
-    <div class="form-group">
-      <label for="dndStart">开始时间 (北京时间)</label>
-      <input type="time" id="dndStart" class="input" value="23:00">
-    </div>
-    <div class="form-group">
-      <label for="dndEnd">结束时间 (北京时间)</label>
-      <input type="time" id="dndEnd" class="input" value="08:00">
-      <span style="font-size:0.75rem;color:var(--md-sys-color-on-surface-variant);">结束≤开始表示跨午夜</span>
-    </div>
-    <div class="form-group">
-      <button class="btn btn-filled" onclick="saveSettings()">💾 保存设置</button>
-      <span id="settingsSaved" style="color:var(--md-sys-color-primary);display:none;">✅ 已保存</span>
-    </div>
-    <div id="stateInfo" class="info-panel">正在加载状态...</div>
-  </div>
-
-  <div class="card">
-    <h2>📝 通知内容配置</h2>
-    <p class="help-text">
-      可用变量：<b>update</b>：<code>{repo}</code> <code>{repo_name}</code> <code>{url}</code> <code>{repo_url}</code> <code>{tag}</code>
-      &nbsp;&nbsp;<b>alert</b>：<code>{repo}</code> <code>{message}</code>
-    </p>
-    <textarea id="notificationTemplate" spellcheck="false" placeholder="JSON 模板内容..."></textarea>
-    <div class="form-group" style="margin-top:12px;">
-      <button class="btn btn-filled" onclick="saveNotificationConfig()">💾 保存模板</button>
-      <span id="notifSaved" style="color:var(--md-sys-color-primary);display:none;">✅ 已保存</span>
-    </div>
-  </div>
-
-  <div class="card">
     <h2>➕ 添加新监控项目</h2>
     <div class="form-group">
       <input type="text" id="repoInput" class="input" placeholder="例如: vuejs/core" onkeydown="if(event.key==='Enter')addRepo()">
@@ -1658,6 +1629,11 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
       <button class="btn btn-tonal" onclick="exportRepos()">📤 导出 TXT</button>
     </div>
     <div id="importResult" class="help-text"></div>
+  </div>
+
+  <div class="card">
+    <h2>📡 检测状态</h2>
+    <div id="stateInfo" class="info-panel">正在加载状态...</div>
   </div>
 
   <div class="card">
@@ -1739,6 +1715,53 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
         </div>
 
         <div class="drawer-group">
+          <h3>⚙️ 检测节奏与免打扰</h3>
+          <div class="form-group">
+            <label for="repoInterval">仓库检查间隔（分钟）</label>
+            <input type="number" id="repoInterval" class="input" min="5" max="60" value="5">
+            <span style="font-size:0.75rem;color:var(--md-sys-color-on-surface-variant);">每仓库等待时间</span>
+          </div>
+          <div class="form-group">
+            <label for="cycleInterval">检测周期间隔（小时）</label>
+            <input type="number" id="cycleInterval" class="input" min="1" max="48" value="8">
+            <span style="font-size:0.75rem;color:var(--md-sys-color-on-surface-variant);">两轮检测之间等待</span>
+          </div>
+          <hr style="border:none;border-top:1px solid var(--md-sys-color-outline-variant);margin:8px 0 16px;">
+          <p class="help-text">🔕 免打扰模式：在指定时段（北京时间 UTC+8）内不发送任何通知；若此间有版本更新，将保留并在免打扰结束后自动补发。</p>
+          <div class="form-group">
+            <label for="dndEnabled">启用免打扰</label>
+            <input type="checkbox" id="dndEnabled">
+            <span id="dndStatus" style="font-size:0.8rem;color:var(--md-sys-color-on-surface-variant);"></span>
+          </div>
+          <div class="form-group">
+            <label for="dndStart">开始时间 (北京时间)</label>
+            <input type="time" id="dndStart" class="input" value="23:00">
+          </div>
+          <div class="form-group">
+            <label for="dndEnd">结束时间 (北京时间)</label>
+            <input type="time" id="dndEnd" class="input" value="08:00">
+            <span style="font-size:0.75rem;color:var(--md-sys-color-on-surface-variant);">结束≤开始表示跨午夜</span>
+          </div>
+          <div class="form-group">
+            <button class="btn btn-filled" onclick="saveSettings()">💾 保存设置</button>
+            <span id="settingsSaved" style="color:var(--md-sys-color-primary);display:none;">✅ 已保存</span>
+          </div>
+        </div>
+
+        <div class="drawer-group">
+          <h3>📝 通知内容配置</h3>
+          <p class="help-text">
+            可用变量：<b>update</b>：<code>{repo}</code> <code>{repo_name}</code> <code>{url}</code> <code>{repo_url}</code> <code>{tag}</code>
+            &nbsp;&nbsp;<b>alert</b>：<code>{repo}</code> <code>{message}</code>
+          </p>
+          <textarea id="notificationTemplate" spellcheck="false" placeholder="JSON 模板内容..."></textarea>
+          <div class="form-group" style="margin-top:12px;">
+            <button class="btn btn-filled" onclick="saveNotificationConfig()">💾 保存模板</button>
+            <span id="notifSaved" style="color:var(--md-sys-color-primary);display:none;">✅ 已保存</span>
+          </div>
+        </div>
+
+        <div class="drawer-group">
           <h3>🧪 手动操作</h3>
           <div style="display:flex;gap:12px;flex-wrap:wrap;">
             <button class="btn btn-tonal" id="testBtn" type="button" onclick="runTest()">🎯 立即测试（随机一个仓库）</button>
@@ -1791,6 +1814,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
 
     document.addEventListener('DOMContentLoaded', () => {
       if (!API_KEY) document.getElementById('authError').style.display = 'block';
+      cacheDomRefs();
       tickClock(); setInterval(tickClock, 1000);
       document.getElementById('repoTableBody').addEventListener('click', (e) => {
         const btn = e.target.closest('.delete-repo-btn');
@@ -1960,6 +1984,19 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
     let updatesCache = [];        // /api/get-updates 的原始列表
     let showIgnored = false;      // 是否展开「已忽略」
 
+    // DOM 引用缓存：render 系列函数高频调用，避免每次 getElementById（DOMContentLoaded 时一次性获取）
+    let elUpdateBanner = null, elUpdateList = null, elIgnoredList = null,
+        elToggleIgnoredBtn = null, elUpdateSummary = null, elUpdateBadge = null, elBellBtn = null;
+    function cacheDomRefs() {
+      elUpdateBanner = document.getElementById('updateBanner');
+      elUpdateList = document.getElementById('updateList');
+      elIgnoredList = document.getElementById('ignoredList');
+      elToggleIgnoredBtn = document.getElementById('toggleIgnoredBtn');
+      elUpdateSummary = document.getElementById('updateSummary');
+      elUpdateBadge = document.getElementById('updateBadge');
+      elBellBtn = document.getElementById('bellBtn');
+    }
+
     // 只接受 http(s) 绝对地址，其余一律不渲染成链接
     function safeUrl(u) {
       if (typeof u !== 'string') return '';
@@ -2011,6 +2048,10 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
       return { active, ignored };
     }
 
+    // 数据签名：id + tag + url + detected_at 拼接，用于判断 /api/get-updates 数据是否真的变化
+    function updatesSignature(list) {
+      return list.length + '|' + list.map(function (u) { return u.id + ':' + (u.repo || '') + ':' + u.tag + ':' + (u.url || '') + ':' + (u.detected_at || ''); }).join(',');
+    }
     let updatesInFlight = false;  // 轮询防重入：上一次 /api/get-updates 未结束时直接跳过
     async function loadUpdates() {
       if (updatesInFlight) return;
@@ -2018,10 +2059,14 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
       try {
         const res = await apiFetch('/api/get-updates');
         const data = await res.json();
-        updatesCache = Array.isArray(data.updates) ? data.updates : [];
-      } catch (e) { updatesCache = []; }
+        const fresh = Array.isArray(data.updates) ? data.updates : [];
+        // 性能：签名没变（数据无变化）就跳过 renderUpdates，避免每 60s 全量重建横幅/列表 DOM
+        if (updatesSignature(fresh) !== updatesSignature(updatesCache)) {
+          updatesCache = fresh;
+          renderUpdates();
+        }
+      } catch (e) { /* 瞬时错误保留旧数据并跳过本次渲染，避免横幅/列表闪烁消失 */ return; }
       finally { updatesInFlight = false; }
-      renderUpdates();
     }
 
     async function loadInappChannel() {
@@ -2055,7 +2100,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
       const parts = splitUpdates();
       renderBanners(inappEnabled ? parts.active : []);
       renderUpdateList(inappEnabled ? parts.active : [], inappEnabled ? parts.ignored : []);
-      const badge = document.getElementById('updateBadge');
+      const badge = elUpdateBadge;
       if (badge) {
         if (inappEnabled && parts.active.length) {
           badge.textContent = parts.active.length > 99 ? '99+' : String(parts.active.length);
@@ -2064,7 +2109,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
           badge.hidden = true;
         }
       }
-      const bell = document.getElementById('bellBtn');
+      const bell = elBellBtn;
       if (bell) bell.style.display = inappEnabled ? '' : 'none';
     }
 
@@ -2074,7 +2119,7 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
     // 避免极端情况下堆叠上百条把主页内容挤走，多余的折叠成一条「查看全部」入口。
     const BANNER_MAX = 5;
     function renderBanners(list) {
-      const box = document.getElementById('updateBanner');
+      const box = elUpdateBanner;
       if (!box) return;
       if (!list.length) { box.innerHTML = ''; return; }
       const shown = list.slice(0, BANNER_MAX);
@@ -2117,10 +2162,10 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
     }
 
     function renderUpdateList(active, ignored) {
-      const box = document.getElementById('updateList');
-      const igBox = document.getElementById('ignoredList');
-      const toggleBtn = document.getElementById('toggleIgnoredBtn');
-      const summary = document.getElementById('updateSummary');
+      const box = elUpdateList;
+      const igBox = elIgnoredList;
+      const toggleBtn = elToggleIgnoredBtn;
+      const summary = elUpdateSummary;
       if (summary) summary.textContent = active.length ? ('共 ' + active.length + ' 条未关闭的更新') : '暂无未关闭的更新';
       if (toggleBtn) toggleBtn.textContent = '查看已忽略 (' + ignored.length + ')';
       if (box) box.innerHTML = active.length ? active.map(u => updateItemHtml(u, false)).join('') : '<div class="empty-hint">暂无更新通知</div>';
