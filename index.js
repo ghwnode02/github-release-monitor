@@ -1408,7 +1408,6 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
       display: inline-block; background: var(--md-primary-light); color: var(--md-primary-700);
       padding: 2px 10px; border-radius: var(--radius-chip); font-size: 0.75rem; font-weight: 500;
     }
-    .subtitle { color: var(--md-on-surface-medium); font-size: 0.8125rem; }
     /* MD2 Card：8px 圆角 + elevation 2 静止 / 4 hover，去掉描边 */
     .card {
       background: var(--md-surface); border-radius: var(--radius-card); padding: var(--space-6);
@@ -1613,7 +1612,6 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
   <header class="app-header">
     <div class="header-left">
       <h1>🔍 GitHub Release 监控</h1>
-      <div class="subtitle" id="clock">北京时间 --:--:--</div>
     </div>
     <div class="header-actions">
       <button class="icon-btn" id="bellBtn" type="button" title="通知中心" aria-label="通知中心" onclick="openDrawer('notifications')">
@@ -1808,10 +1806,6 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
       const s = b.getUTCFullYear() + '-' + p(b.getUTCMonth() + 1) + '-' + p(b.getUTCDate()) + ' ' + p(b.getUTCHours()) + ':' + p(b.getUTCMinutes()) + ':' + p(b.getUTCSeconds());
       return withZone ? s + ' (北京时间)' : s;
     }
-    function tickClock() {
-      const el = document.getElementById('clock');
-      if (el) el.textContent = '北京时间 ' + fmtBJ(new Date(), false);
-    }
 
     async function apiFetch(url, options = {}) {
       const headers = options.headers || {};
@@ -1832,7 +1826,6 @@ const HTML_TEMPLATE = `<!DOCTYPE html>
     document.addEventListener('DOMContentLoaded', () => {
       if (!API_KEY) document.getElementById('authError').style.display = 'block';
       cacheDomRefs();
-      tickClock(); setInterval(tickClock, 1000);
       document.getElementById('repoTableBody').addEventListener('click', (e) => {
         const btn = e.target.closest('.delete-repo-btn');
         if (btn) { const repo = btn.dataset.repo; if (repo) deleteRepo(repo); }
