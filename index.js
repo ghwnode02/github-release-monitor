@@ -97,6 +97,10 @@ function isDndActive(dnd, now = new Date()) {
 // ==================== D1 表初始化（使用单行 prepare + run） ====================
 let dbInitPromise = null;
 
+// schema 版本标记：命中即跳过全部 DDL/PRAGMA 兼容检查（cron 基本每次都是冷启动，
+// 这一步能把每次冷启动的 9 条 D1 往返压到 1 条读）。新增迁移时把 SCHEMA_VERSION +1 即可重新执行。
+const SCHEMA_VERSION = 1;
+
 async function initDB(db, retries = 3) {
   if (dbInitPromise) {
     try {
@@ -109,6 +113,21 @@ async function initDB(db, retries = 3) {
 
   const attempt = async (remaining) => {
     try {
+      // 快路径：settings 表不存在（全新库）时该查询会抛错，日志后走完整建表流程。
+      // 注意：这里的 DDL 必须保持幂等（CREATE TABLE IF NOT EXISTS / duplicate column 可忽略），
+      // 否则标记未写入时会反复重试。数据库整体故障会在此记 warn 并退化为每冷启动全量建表。
+      let marker = null;
+      try {
+        marker = await db.prepare("SELECT value FROM settings WHERE key = 'system:schema_version'").first();
+      } catch (e) {
+        console.warn("读取 schema 版本标记失败（将执行完整建表流程）", e && e.message);
+        marker = null;
+      }
+      if (marker && Number(marker.value) === SCHEMA_VERSION) {
+        dbInitPromise = Promise.resolve();
+        return;
+      }
+
       // 全部使用 prepare().run()，每条 SQL 为单行字符串，末尾不带分号
       await db.prepare(`CREATE TABLE IF NOT EXISTS check_state (id INTEGER PRIMARY KEY DEFAULT 1, phase TEXT NOT NULL DEFAULT 'waiting', current_index INTEGER NOT NULL DEFAULT 0, cycle_start_time TEXT, last_repo_check_time TEXT, cycle_end_time TEXT, cycle_repos TEXT, total_repos INTEGER DEFAULT 0, version INTEGER NOT NULL DEFAULT 0)`).run();
 
@@ -164,6 +183,9 @@ async function initDB(db, retries = 3) {
           if (!e.message.includes('duplicate column')) throw e;
         }
       }
+
+      await db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('system:schema_version', ?1)")
+        .bind(String(SCHEMA_VERSION)).run();
 
       dbInitPromise = Promise.resolve();
       return;
@@ -236,15 +258,19 @@ async function setCheckState(db, state) {
   }
 }
 
-async function withOptimisticLock(db, mutator, maxRetries = 3) {
+// initialState：调用方已读过 state 时传入，省掉一轮 getCheckState（cron 每轮可少一次 D1 读）。
+// 冲突或任何异常后强制置空，下一轮重读（避免拿旧快照重复 CAS）。
+async function withOptimisticLock(db, mutator, maxRetries = 3, initialState = null) {
+  let state = initialState;
   for (let i = 0; i < maxRetries; i++) {
     try {
-      const state = await getCheckState(db);
+      if (state === null) state = await getCheckState(db);
       const modified = await mutator(state);
       if (modified === null) return;
       await setCheckState(db, modified);
       return;
     } catch (e) {
+      state = null;
       if (e.message !== "CAS_WRITE_CONFLICT" || i === maxRetries - 1) throw e;
       await new Promise(r => setTimeout(r, 50 * Math.pow(2, i)));
     }
@@ -252,7 +278,7 @@ async function withOptimisticLock(db, mutator, maxRetries = 3) {
 }
 
 // 原子地获取下一个要检查的仓库（闭包传出 item）
-async function tryAdvanceAndGetRepo(db) {
+async function tryAdvanceAndGetRepo(db, preState = null) {
   let advancedItem = null;
   await withOptimisticLock(db, (state) => {
     if (state.phase !== 'checking') return null;
@@ -270,7 +296,7 @@ async function tryAdvanceAndGetRepo(db) {
       state.cycleEndTime = state.lastRepoCheckTime;
     }
     return state;
-  }, 3);
+  }, 3, preState);
   return advancedItem ? { item: advancedItem } : null;
 }
 
@@ -426,63 +452,58 @@ async function addRepo(db, repo, custom_url, note = '') {
 }
 
 async function deleteRepo(db, repo) {
+  // 连 release_events 一起清：否则已删仓库的历史通知会永远卡在通知中心
   await db.batch([
     db.prepare("DELETE FROM repos WHERE repo = ?").bind(repo),
-    db.prepare("DELETE FROM repo_state WHERE repo = ?").bind(repo)
+    db.prepare("DELETE FROM repo_state WHERE repo = ?").bind(repo),
+    db.prepare("DELETE FROM release_events WHERE repo = ?").bind(repo)
   ]);
 }
 
-// repo_state 单列更新统一使用 ON CONFLICT 避免覆盖
-async function getRepoTag(db, repo) {
-  const row = await db.prepare("SELECT tag FROM repo_state WHERE repo = ?").bind(repo).first();
-  return row ? row.tag : null;
+// repo_state 读写统一走「整行读 / 合并写」，把一次巡检的 5 次读 + 最多 6 次写压到 1~2 条 SQL。
+// D1 单次往返是本项目最贵的操作（延迟 + 配额 + 失败面），能合并的绝不拆开。
+const STATE_EMPTY = { tag: null, etag: null, errors: null, notifiedTag: null, attempts: 0 };
+
+async function getRepoStateRow(db, repo) {
+  const row = await db.prepare("SELECT tag, etag, errors_json, last_notified_tag, notify_attempts FROM repo_state WHERE repo = ?").bind(repo).first();
+  if (!row) return { ...STATE_EMPTY };
+  let errors = null;
+  if (row.errors_json) {
+    try { errors = JSON.parse(row.errors_json); } catch (e) { errors = null; }
+  }
+  return {
+    tag: row.tag || null,
+    etag: row.etag || null,
+    errors,
+    notifiedTag: row.last_notified_tag || null,
+    attempts: row.notify_attempts || 0
+  };
 }
 
-async function setRepoTag(db, repo, tag) {
-  await db.prepare(`INSERT INTO repo_state (repo, tag) VALUES (?1, ?2)
-    ON CONFLICT(repo) DO UPDATE SET tag = excluded.tag`).bind(repo, tag).run();
+// patch 只允许 repo_state 的已知列；errors_json 传对象自动序列化，传 null 表示清空。
+const STATE_WRITE_COLS = ['tag', 'etag', 'errors_json', 'last_notified_tag', 'notify_attempts'];
+async function writeRepoState(db, repo, patch) {
+  const cols = [];
+  const vals = [];
+  for (const c of STATE_WRITE_COLS) {
+    if (!(c in patch)) continue;
+    const v = patch[c];
+    cols.push(c);
+    vals.push(c === 'errors_json'
+      ? (v === null || v === undefined ? null : JSON.stringify(v))
+      : (v === undefined ? null : v));
+  }
+  if (!cols.length) return;
+  const n = cols.length;
+  const marks = cols.map((_, i) => '?' + (i + 1)).join(', ');
+  const sets = cols.map(c => c + ' = excluded.' + c).join(', ');
+  await db.prepare(`INSERT INTO repo_state (repo, ${cols.join(', ')}) VALUES (?${n + 1}, ${marks}) ON CONFLICT(repo) DO UPDATE SET ${sets}`)
+    .bind(...vals, repo).run();
 }
 
-async function getRepoEtag(db, repo) {
-  const row = await db.prepare("SELECT etag FROM repo_state WHERE repo = ?").bind(repo).first();
-  return row ? row.etag : null;
-}
-
-async function setRepoEtag(db, repo, etag) {
-  await db.prepare(`INSERT INTO repo_state (repo, etag) VALUES (?1, ?2)
-    ON CONFLICT(repo) DO UPDATE SET etag = excluded.etag`).bind(repo, etag).run();
-}
-
-// 最近一次成功推送通知的版本（用于去重，避免同一版本被反复通知）
-async function getRepoNotifiedTag(db, repo) {
-  const row = await db.prepare("SELECT last_notified_tag FROM repo_state WHERE repo = ?").bind(repo).first();
-  return row ? row.last_notified_tag : null;
-}
-async function setRepoNotifiedTag(db, repo, tag) {
-  await db.prepare(`INSERT INTO repo_state (repo, last_notified_tag) VALUES (?1, ?2)
-    ON CONFLICT(repo) DO UPDATE SET last_notified_tag = excluded.last_notified_tag`).bind(repo, tag).run();
-}
-
-// 当前版本推送失败后的重试计数
-async function getNotifyAttempts(db, repo) {
-  const row = await db.prepare("SELECT notify_attempts FROM repo_state WHERE repo = ?").bind(repo).first();
-  return row ? (row.notify_attempts || 0) : 0;
-}
-async function resetNotifyAttempts(db, repo) {
-  await db.prepare(`INSERT INTO repo_state (repo, notify_attempts) VALUES (?1, 0)
-    ON CONFLICT(repo) DO UPDATE SET notify_attempts = 0`).bind(repo).run();
-}
 async function incNotifyAttempts(db, repo) {
   await db.prepare(`INSERT INTO repo_state (repo, notify_attempts) VALUES (?1, 1)
     ON CONFLICT(repo) DO UPDATE SET notify_attempts = notify_attempts + 1`).bind(repo).run();
-}
-
-async function getErrorsForRepo(db, repo) {
-  const row = await db.prepare("SELECT errors_json FROM repo_state WHERE repo = ?").bind(repo).first();
-  if (row && row.errors_json) {
-    try { return JSON.parse(row.errors_json); } catch {}
-  }
-  return null;
 }
 
 async function getErrorsMap(db) {
@@ -494,16 +515,6 @@ async function getErrorsMap(db) {
   return map;
 }
 
-async function saveErrorsForRepo(db, repo, errorsObj) {
-  if (errorsObj === null) {
-    await db.prepare("UPDATE repo_state SET errors_json = NULL WHERE repo = ?").bind(repo).run();
-  } else {
-    await db.prepare(`INSERT INTO repo_state (repo, errors_json) VALUES (?1, ?2)
-      ON CONFLICT(repo) DO UPDATE SET errors_json = excluded.errors_json`)
-      .bind(repo, JSON.stringify(errorsObj)).run();
-  }
-}
-
 // ==================== Worker 入口 ====================
 let lastTestTime = 0;
 export default {
@@ -511,10 +522,12 @@ export default {
     const db = env.DB;
     try {
       await initDB(db);
-      ctx.waitUntil(performScheduledCheck(env));
     } catch (e) {
       console.error("定时任务初始化失败", e);
+      return;
     }
+    // 巡检内部异常必须落日志：否则 waitUntil 里的拒绝会变成静默失败，线上看不出任何痕迹
+    ctx.waitUntil(performScheduledCheck(env).catch((e) => console.error("定时巡检异常", e)));
   },
 
   async fetch(request, env, ctx) {
@@ -564,8 +577,7 @@ export default {
     // 设置
     if (url.pathname === "/api/get-settings") {
       try {
-        const settings = await getSettings(db);
-        const state = await getCheckState(db);
+        const [settings, state] = await Promise.all([getSettings(db), getCheckState(db)]);
         return jsonResponse({ settings, state });
       } catch (e) {
         return jsonResponse({ error: "D1 状态读取失败: " + e.message }, 500);
@@ -889,19 +901,12 @@ export default {
 async function performScheduledCheck(env) {
   const db = env.DB;
 
-  let state;
+  // state 与 settings 互不依赖，并行读取（每 5 分钟一轮，省下的都是实打实的延迟）
+  let state, settings;
   try {
-    state = await getCheckState(db);
+    [state, settings] = await Promise.all([getCheckState(db), getSettings(db)]);
   } catch (e) {
-    console.error("读取检查状态失败", e);
-    return;
-  }
-
-  let settings;
-  try {
-    settings = await getSettings(db);
-  } catch (e) {
-    console.error("读取设置失败", e);
+    console.error("读取检查状态/设置失败", e);
     return;
   }
 
@@ -934,7 +939,8 @@ async function performScheduledCheck(env) {
       }
     }
 
-    const result = await tryAdvanceAndGetRepo(db);
+    // 复用本轮已读的 state 做 CAS，避免 withOptimisticLock 内部再读一次
+    const result = await tryAdvanceAndGetRepo(db, state);
     if (!result) return;
 
     await checkSingleRepo(env, result.item, false, settings.dnd);
@@ -968,13 +974,13 @@ async function checkSingleRepo(env, item, forceTrigger, dndSettings) {
     dndActive = isDndActive(dndSettings);
   }
 
-  let errorInfo = null;
-  if (!forceTrigger) {
-    errorInfo = await getErrorsForRepo(db, repo);
-    if (errorInfo && errorInfo.permanent) return { repo, success: true, skipped: true };
-  }
+  // 整行读：tag / etag / errors / 已通知版本 / 重试计数 一次拿全（原先是 5 条独立查询）
+  const st = forceTrigger ? { ...STATE_EMPTY } : await getRepoStateRow(db, repo);
+  let errorInfo = st.errors;
 
-  const oldTag = forceTrigger ? null : await getRepoTag(db, repo);
+  if (!forceTrigger && errorInfo && errorInfo.permanent) return { repo, success: true, skipped: true };
+
+  const oldTag = forceTrigger ? null : st.tag;
   const githubHeaders = {
     "User-Agent": "CF-Worker-Release-Monitor",
     Accept: "application/vnd.github+json"
@@ -984,9 +990,8 @@ async function checkSingleRepo(env, item, forceTrigger, dndSettings) {
   let data, fromCache = false, res;
   try {
     let etagCache = null;
-    if (!forceTrigger) {
-      const etagStr = await getRepoEtag(db, repo);
-      if (etagStr) try { etagCache = JSON.parse(etagStr); } catch {}
+    if (!forceTrigger && st.etag) {
+      try { etagCache = JSON.parse(st.etag); } catch (e) { etagCache = null; }
     }
 
     const headers = { ...githubHeaders };
@@ -1009,7 +1014,7 @@ async function checkSingleRepo(env, item, forceTrigger, dndSettings) {
               lastTime: now,
               permanent: true
             };
-            await saveErrorsForRepo(db, repo, errorInfo);
+            await writeRepoState(db, repo, { errors_json: errorInfo });
             const template = await getNotificationTemplate(db);
             await sendAlertNotification(env, db, buildPayload(template.alert, { repo, message: cause404, reason: cause404, judge_reason: errorInfo.judgeReason }));
           }
@@ -1047,16 +1052,22 @@ async function checkSingleRepo(env, item, forceTrigger, dndSettings) {
     if (!data) throw new Error("无法获取 release 信息");
     const latestTag = data.tag_name;
 
-    if (!forceTrigger && !fromCache && res) {
-      await setRepoEtag(db, repo, JSON.stringify({ etag: res.headers.get("etag") || "" }));
-    }
+    const isNew = latestTag && latestTag !== oldTag;
 
+    // 写合并：etag / 错误计数衰减 / 观测到新版本 三条 UPSERT 压成一条（推送前的落盘，
+    // 保证推送卡死时下一轮不会把同一版本当「全新」重复处理）
+    const patch = {};
+    if (!forceTrigger && !fromCache && res) patch.etag = JSON.stringify({ etag: res.headers.get("etag") || "" });
     if (!forceTrigger && errorInfo) {
       errorInfo = decayErrorCountForRepo(errorInfo, now);
-      await saveErrorsForRepo(db, repo, errorInfo);
+      patch.errors_json = errorInfo;
     }
+    if (!forceTrigger && isNew) {
+      patch.tag = latestTag;
+      patch.notify_attempts = 0;
+    }
+    if (Object.keys(patch).length) await writeRepoState(db, repo, patch);
 
-    const isNew = latestTag && latestTag !== oldTag;
     // 站内通知中心：记录「新版本」事件（release_events 靠 UNIQUE(repo, tag) 去重，重复不会叠加）。
     // 记与不记的语义：
     //   ① 每轮巡检只记「真的新版本」（isNew && oldTag 有值）——否则 32 个仓库跑完一个周期会全部变成「更新」噪音；
@@ -1077,15 +1088,11 @@ async function checkSingleRepo(env, item, forceTrigger, dndSettings) {
       await recordReleaseEvent(db, repo, latestTag, eventUrl);
     }
     // 已成功通知的版本（去重依据）；forceTrigger 时不读取，始终强制推送
-    const lastNotified = forceTrigger ? null : await getRepoNotifiedTag(db, repo);
+    const lastNotified = forceTrigger ? null : st.notifiedTag;
     const alreadyNotified = !!latestTag && latestTag === lastNotified;
-    const attempts = forceTrigger ? 0 : await getNotifyAttempts(db, repo);
-
-    // 观测到全新版本：立即记录已观测版本并重置重试计数（避免反复当作「全新」重抓 / 重复判定）
-    if (!forceTrigger && isNew) {
-      await setRepoTag(db, repo, latestTag);
-      await resetNotifyAttempts(db, repo);
-    }
+    // 观测到新版本时上方 UPSERT 已把 notify_attempts 归零，这里等效读取必须为 0，
+    // 否则上一版本攒下的失败次数（最高 3）会把这条真新版本直接判为「重试超限」而漏发。
+    const attempts = forceTrigger ? 0 : (isNew ? 0 : st.attempts);
 
     // 仅在「未成功通知过当前版本」且「重试次数未达上限」时才推送；forceTrigger 始终推送
     const needNotify = forceTrigger || (!alreadyNotified && attempts < MAX_NOTIFY_ATTEMPTS);
@@ -1094,21 +1101,22 @@ async function checkSingleRepo(env, item, forceTrigger, dndSettings) {
       if (dndActive) {
         return { repo, success: true, dnd_hold: true };
       }
-      const template = await getNotificationTemplate(db);
+      // 模板与通道互不依赖，并行取，省一次 D1 往返
+      const [template, channel] = await Promise.all([getNotificationTemplate(db), getNotifyChannel(db)]);
       const repoName = repo.split("/")[1] || repo;
       const notifVars = { repo, repo_name: repoName, url: targetUrl, repo_url: targetUrl, tag: latestTag || oldTag || "测试" };
       const fields = buildPayload(template.update, notifVars);
-      const pushOk = await deliverNotification(env, db, fields, { rawVars: notifVars });
+      const pushOk = await deliverNotification(env, db, fields, { rawVars: notifVars, channel });
 
       if (pushOk) {
-        // 推送成功：标记该版本已通知并清零重试计数
-        await setRepoNotifiedTag(db, repo, latestTag);
-        await resetNotifyAttempts(db, repo);
-        if (forceTrigger) await setRepoTag(db, repo, latestTag);
-      } else {
+        // 推送成功：标记该版本已通知并清零重试计数（一条 UPSERT 覆盖原先 2~3 条写）
+        const patch2 = { last_notified_tag: latestTag, notify_attempts: 0 };
+        if (forceTrigger) patch2.tag = latestTag;
+        await writeRepoState(db, repo, patch2);
+      } else if (!forceTrigger) {
         // 推送失败：递增重试计数；达到上限后停止，避免无限重复通知
         // 手动测试(forceTrigger)失败不计入重试次数，避免抬高真实巡检的 attempts
-        if (!forceTrigger) await incNotifyAttempts(db, repo);
+        await incNotifyAttempts(db, repo);
       }
 
       return { repo, success: true, push_ok: pushOk, is_new: !forceTrigger && isNew };
@@ -1134,7 +1142,12 @@ async function checkSingleRepo(env, item, forceTrigger, dndSettings) {
         errorInfo.alertedAt = now;
       }
 
-      await saveErrorsForRepo(db, repo, errorInfo);
+      // 落盘失败不能让整轮巡检抛异常：告警已发出，下一轮会重新计数并重试
+      try {
+        await writeRepoState(db, repo, { errors_json: errorInfo });
+      } catch (e2) {
+        console.error("保存错误计数失败（不影响本轮返回）", e2);
+      }
     }
     return { repo, success: false };
   }
@@ -1176,6 +1189,9 @@ async function handleRename(env, oldRepo, newRepo, tag) {
     db.prepare("INSERT OR IGNORE INTO repo_state (repo, tag, etag, errors_json, last_notified_tag, notify_attempts) SELECT ?1, tag, etag, errors_json, last_notified_tag, notify_attempts FROM repo_state WHERE repo = ?2")
       .bind(newRepo, oldRepo),
     db.prepare("DELETE FROM repo_state WHERE repo = ?").bind(oldRepo),
+    // 历史通知跟随改名：先删掉会撞 UNIQUE(repo, tag) 的旧名行，避免残留孤儿数据长期占位
+    db.prepare("DELETE FROM release_events WHERE repo = ?2 AND tag IN (SELECT tag FROM release_events WHERE repo = ?1)").bind(newRepo, oldRepo),
+    db.prepare("UPDATE OR IGNORE release_events SET repo = ?1 WHERE repo = ?2").bind(newRepo, oldRepo),
     db.prepare("INSERT OR IGNORE INTO repo_state (repo) VALUES (?)").bind(newRepo)
   ]);
 
@@ -1214,7 +1230,8 @@ async function sendAlertNotification(env, db, payload) {
 }
 
 async function deliverNotification(env, db, fields, opts = {}) {
-  const channel = await getNotifyChannel(db);
+  // channel 由调用方预取传入（与通知模板并行取），未传才回查，省一次 D1 往返
+  const channel = opts.channel !== undefined ? opts.channel : await getNotifyChannel(db);
   let url, method, headers, bodyStr;
   if (channel && channel.enabled && channel.url) {
     // 走配置驱动通道（别人的/自己的都在各自的 D1 配置里）
